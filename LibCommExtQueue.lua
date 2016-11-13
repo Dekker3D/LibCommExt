@@ -30,8 +30,13 @@ function LibCommExtQueue:Print(strToPrint)
 	end
 end
 
+function LibCommExtQueue:OnLoad()
+	Print("LibCommExtQueue loaded")
+end
+
 function LibCommExtQueue:EnsureInit()
 	if self.Initialized == true then return end
+	self:Print("Initializing")
 	self.Queue = self.Queue or {}
 	self.Initialized = true
 	self.IgnoredSenders = {}
@@ -89,6 +94,7 @@ end
 
 function LibCommExtQueue:HandleMessage()
 	self:EnsureInit()
+	self:Print("Adding message to queue")
 	if self.CurrentMessage ~= nil and self:CheckSendingLibrary(self.CurrentMessage.SendingLibrary) then
 		local sent = self.CurrentMessage.SendingLibrary.HandleQueue(self.CurrentMessage.Message, self.RemainingCharacters)
 		local validResult = true
@@ -153,3 +159,4 @@ function LibCommExtQueue:RemoveMessageFromQueue(message)
 end
 
 Apollo.RegisterPackage(LibCommExtQueue, MAJOR, MINOR, {})
+Print("LibCommExtQueue loading")

@@ -35,17 +35,18 @@ function LibCommExt:EnsureInit()
 		self.ChannelTable = self.ChannelTable or {}
 		self.Initialized = true
 	end
-	if self.QueueReady ~= true then
-		LibCommExtQueuePkg = Apollo.GetPackage("LibCommExtQueue-1.0")
-		if LibCommExtQueuePkg ~= nil and LibCommExtQueuePkg.tPackage ~= nil then
-			LibCommExtQueue = LibCommExtQueuePkg.tPackage
-			self.QueueReady = true
+	if LibCommExt == nil then
+		LibCommExtQueuePkg = Apollo.GetPackage("LibCommExtQueue")
+		if LibCommExtQueuePkg ~= nil then
+			LibCommExt = LibCommExtQueuePkg.tPackage
 		end
 	end
-	if self.QueueReady == true and self.Initialized == true then self.Ready = true end
+	if self.Initialized == true then self.Ready = true end
 end
 
 function LibCommExt:GetChannel(channelName)
+	self:EnsureInit()
+	self:Print("Test")
 	if channelName == nil or type(channelName) ~= "string" then return end
 	if self.ChannelTable[channelName] == nil then
 		self.ChannelTable[channelName] = CommExtChannel:new(channelName)
@@ -53,15 +54,64 @@ function LibCommExt:GetChannel(channelName)
 	return self.ChannelTable[channelName]
 end
 
-function CommExtChannel:new(channelName)
+function LibCommExt:Encode(numToEncode)
+	if numToEncode == nil then
+		return '-'
+	end
+	local b64='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+	return b64:sub(numToEncode,numToEncode)
+end
+
+function LibCommExt:EncodeMore(num, amount) -- "amount" gives the number of characters to use to encode this number.
+	if num == nil or amount == nil then return end
+	num = num - 1
+	local ret = ""
+	for i=1, amount, 1 do
+		ret = ret .. self:Encode((num % 64) + 1)
+		num = num / 64
+	end
+	return ret
+end
+
+function LibCommExt:Decode(charToDecode)
+	if charToDecode == '-' then
+		return nil
+	end
+	local b64='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+	return string.find(b64, charToDecode,1)
+end
+
+function LibCommExt:DecodeMore(str, amount) -- "amount" is optional and gives the number of characters to decode. Will decode entire string otherwise.
+	if str == nil then return nil end
+	if amount ~= nil and type(amount) == "number" and str:len() > amount then
+		str = str:sub(1, amount)
+	end
+	local num = 0
+	local mult = 1
+	for i=1, str:len(), 1 do
+		num = num + (self:Decode(str:sub(i,i)) - 1) * mult
+		mult = mult * 64
+	end
+	return num + 1
+end
+
+
+function CommExtChannel:new(channelName, bare)
 	if channelName == nil or type(channelName) ~= "string" then return end
 	o = {}
 	setmetatable(o, self)
 	self.__index = self
 	o.Channel = channelName
+	o.Bare = bare -- just send and receive, don't wrap messages in anything.
 	o.Callbacks = {}
 	o:Connect()
 	return o
+end
+
+function CommExtChannel:Print(strToPrint)
+	if strToPrint ~= nil then
+	 	Print("CommExtChannel: " .. strToPrint)
+	end
 end
 
 function CommExtChannel:Connect()
@@ -85,7 +135,11 @@ function CommExtChannel:IsReady()
 end
 
 function CommExtChannel:AddReceiveCallback(callback, owner)
-	table.insert(self.Callbacks, {Callback = callback, Owner = owner})
+	if type(callback) == "function" then
+		table.insert(self.Callbacks, {Callback = callback, Owner = owner})
+	elseif type(callback) == "string" then
+		table.insert(self.Callbacks, {Callback = owner[callback], Owner = owner})
+	end
 end
 
 function CommExtChannel:OnJoinResult(channel, eResult)
@@ -97,19 +151,19 @@ function CommExtChannel:OnJoinResult(channel, eResult)
 			self:Print('Channel is not ready to transmit')
 		end
 	elseif eResult == ICCommLib.CodeEnumICCommJoinResult.BadName then
-		self:Print(1, 'Channel ' .. channel .. ' has a bad name.')
+		self:Print('Channel ' .. channel .. ' has a bad name.')
 	elseif eResult == ICCommLib.CodeEnumICCommJoinResult.Left then
-		self:Print(1, 'Failed to join channel')
+		self:Print('Failed to join channel')
 	elseif eResult == ICCommLib.CodeEnumICCommJoinResult.MissingEntitlement then
-		self:Print(1, 'Failed to join channel')
+		self:Print('Failed to join channel')
 	elseif eResult == ICCommLib.CodeEnumICCommJoinResult.NoGroup then
-		self:Print(1, 'Failed to join channel')
+		self:Print('Failed to join channel')
 	elseif eResult == ICCommLib.CodeEnumICCommJoinResult.NoGuild then
-		self:Print(1, 'Failed to join channel')
+		self:Print('Failed to join channel')
 	elseif eResult == ICCommLib.CodeEnumICCommJoinResult.TooManyChannels then
-		self:Print(1, "You are in too many channels to join the TIM channel")
+		self:Print("You are in too many channels to join the TIM channel")
 	else
-		self:Print(1, 'Failed to join channel; join result: ' .. eResult)
+		self:Print('Failed to join channel; join result: ' .. eResult)
 	end
 end
 
@@ -120,11 +174,16 @@ function CommExtChannel:OnMessageReceived(channel, strMessage, strSender)
 end
 
 function CommExtChannel:SendMessage(message, version, priority)
-	self:SendPrivateMessage(message, nil, version, priority)
+	self:SendPrivateMessage(nil, message, version, priority)
 end
 
-function CommExtChannel:SendPrivateMessage(message, recipient, version, priority) -- secretly doubles as the non-private-message function.
-	if message == nil then
+function CommExtChannel:SendPrivateMessage(recipient, message, version, priority) -- secretly doubles as the non-private-message function.
+	LibCommExt:EnsureInit()
+	LibCommExtQueue:AddToQueue({Message = message, Recipient = recipient, Version = version}, priority, self)
+end
+
+function CommExtChannel:SendActualMessage(message)
+	if message == nil or message.Message == nil then
 		return true
 	end
 	if self.Comm == nil then
@@ -134,16 +193,14 @@ function CommExtChannel:SendPrivateMessage(message, recipient, version, priority
 		self:Connect()
 		return false
 	end
-	if recipient == nil then
-		if self.Comm:SendMessage(message) then
-			self:Print(5, "Message Sent: " .. message)
-			if self.heartBeatTimer ~= nil then self.heartBeatTimer:Stop() end
-			self.heartBeatTimer = ApolloTimer.Create(60.0, true, "sendHeartbeatMessage", self)
+	if message.Recipient == nil then
+		if self.Comm:SendMessage(message.Message) then
+			self:Print("Message Sent: " .. message.Message)
 			return true
 		end
 	else
-		if self.Comm:SendPrivateMessage(recipient, message) then
-			self:Print(5, "Message Sent to " .. recipient .. ": " .. message)
+		if self.Comm:SendPrivateMessage(message.Recipient, message.Message) then
+			self:Print("Message Sent to " .. message.Recipient.. ": " .. message.Message)
 			return true
 		end
 	end
@@ -153,9 +210,29 @@ end
 
 function CommExtChannel:HandleQueue(message, remainingChars)
 	if remainingChars >= message.Length then
-		return message.Length
+		if self:SendActualMessage(message) then
+			return message.Message.len()
+		end
 	end
 	return 0
 end
 
-Apollo.RegisterPackage(LibCommExt, MAJOR, MINOR, {})
+function CommExtChannel:Encode(numToEncode)
+	return LibCommExt:Encode(numToEncode)
+end
+
+function CommExtChannel:EncodeMore(num, amount)
+	return LibCommExt:EncodeMore(num, amount)
+end
+
+function CommExtChannel:Decode(charToDecode) 
+	return LibCommExt:Decode(charToDecode)
+end
+
+function CommExtChannel:DecodeMore(str, amount)
+	return LibCommExt:DecodeMore(str, amount)
+end
+
+LibCommExt:EnsureInit()
+
+Apollo.RegisterPackage(LibCommExt, MAJOR, MINOR, {"LibCommExtQueue"})

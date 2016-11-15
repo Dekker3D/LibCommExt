@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Addon Author="Dekker3D" APIVersion="13" Name="ThisIsMe" Description="Shares RP profiles" Version="0.1">
+<Addon Author="Dekker3D" APIVersion="14" Name="LibcommExt" Description="Communication library for addons" Version="0.1">
     <Script Name="LibCommExt.lua"/>
-    <Script Name="LibCommExtQueue.lua"/>
 </Addon>

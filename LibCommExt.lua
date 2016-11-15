@@ -16,12 +16,8 @@ local LibCommExt = APkg and APkg.tPackage or {}
 
 local CommExtChannel = {}
 
-local QueueReady = false
-local LibCommExtQueuePkg = nil
-local LibCommExtQueue = nil
-
 ---------------------------------------------------------------------------------------------------
--- Utility Functions
+-- LibCommExt Functions
 ---------------------------------------------------------------------------------------------------
 
 function LibCommExt:Print(strToPrint)
@@ -33,25 +29,113 @@ end
 function LibCommExt:EnsureInit()
 	if self.Initialized ~= true then
 		self.ChannelTable = self.ChannelTable or {}
+		setmetatable(self.ChannelTable, {__mode = "v"})
+		self.Queue = self.Queue or {}
 		self.Initialized = true
-	end
-	if LibCommExt == nil then
-		LibCommExtQueuePkg = Apollo.GetPackage("LibCommExtQueue")
-		if LibCommExtQueuePkg ~= nil then
-			LibCommExt = LibCommExtQueuePkg.tPackage
-		end
 	end
 	if self.Initialized == true then self.Ready = true end
 end
 
 function LibCommExt:GetChannel(channelName)
 	self:EnsureInit()
-	self:Print("Test")
 	if channelName == nil or type(channelName) ~= "string" then return end
 	if self.ChannelTable[channelName] == nil then
 		self.ChannelTable[channelName] = CommExtChannel:new(channelName)
 	end
 	return self.ChannelTable[channelName]
+end
+
+function LibCommExt:AddToQueue(message)
+	self:EnsureInit()
+	self.SequenceNum = (self.SequenceNum or 0) + 1
+	message.SequenceNum = self.SequenceNum
+	table.insert(self.Queue, message)
+	
+--[[	table.sort(self.Queue, function(a,b)
+		if a == nil and b == nil then return false end
+		if a == nil then return true end -- a should go at the end
+		if b == nil then return false end -- b should go at the end
+		if a.Priority ~= b.Priority then
+			if a.Priority == nil then return true end
+			if b.Priority == nil then return false end
+			return a.Priority > b.Priority -- higher priority goes lower in the list
+		end
+		return a.SequenceNum < b.SequenceNum
+	end)]]
+	
+	if self.Timer == nil then -- Start sending immediately if we've run out of messages and had been waiting.
+		self:MessageLoop()
+		self.Timer = ApolloTimer.Create(1, true, "MessageLoop", self)
+	end
+end
+
+function LibCommExt:IsTableEmpty(table)
+	return next(table) == nil
+end
+
+function LibCommExt:MessageLoop()
+	self:EnsureInit()
+	if self:IsTableEmpty(self.Queue) then
+		self.Timer:Stop()
+		self.Timer = nil
+		return
+	end
+	self.CharactersSent = 0
+	self.RemainingCharacters = 90 -- safety margin. We don't want to get throttled, and some addons might use minimal amounts of traffic and not want this library.
+	for _, v in ipairs(self.Queue) do
+		self.CurrentMessage = v
+		pcall(function() self:HandleMessage() end)
+	end
+end
+
+function LibCommExt:HandleMessage()
+	self:EnsureInit()
+	if self.CurrentMessage ~= nil and self.CurrentMessage.Message ~= nil then
+		local sent = self.CurrentMessage.SendingLibrary:HandleQueue(self.CurrentMessage, self.RemainingCharacters)
+		self.CharactersSent = self.CharactersSent + sent
+		self.RemainingCharacters = self.RemainingCharacters - sent
+		if sent > 0 then
+			self:RemoveFromList(self.Queue, self.CurrentMessage)
+		end
+	end
+end
+
+function LibCommExt:RemoveFromList(targetTable, item)
+	local key = nil
+	for k, v in pairs(targetTable) do
+		if v == item then
+			key = k
+			break
+		end
+	end
+	if key ~= nil then
+		table.remove(targetTable, key)
+	end
+end
+
+function LibCommExt:FilterList(table, func)
+	local keysArray = {}
+	local keysTable = {}
+	for k, v in pairs(table) do
+		if func(v) then
+			if type(k) == "number" then
+				table.insert(keysArray, k)
+			else
+				table.insert(keysTable, k)
+			end
+		end
+	end
+	for k, v in pairs(keysTable) do
+		table[v] = nil
+	end
+	table.sort(keysArray, function(a,b) return a > b end)
+	for v in ipairs(keysArray) do
+		table.remove(table, v) -- remove in reverse order.
+	end
+end
+
+function LibCommExt:RemoveMessageFromQueue(message)
+	self:RemoveFromList(self.Queue, message)
 end
 
 function LibCommExt:Encode(numToEncode)
@@ -96,13 +180,18 @@ function LibCommExt:DecodeMore(str, amount) -- "amount" is optional and gives th
 end
 
 
-function CommExtChannel:new(channelName, bare)
+---------------------------------------------------------------------------------------------------
+-- CommExtChannel Functions
+---------------------------------------------------------------------------------------------------
+
+
+function CommExtChannel:new(channelName, commExtVersion)
 	if channelName == nil or type(channelName) ~= "string" then return end
 	o = {}
 	setmetatable(o, self)
 	self.__index = self
 	o.Channel = channelName
-	o.Bare = bare -- just send and receive, don't wrap messages in anything.
+	o.CommExtVersion = commExtVersion -- 0 is bare messages, anything else will implement some fancy functionality.
 	o.Callbacks = {}
 	o:Connect()
 	return o
@@ -134,6 +223,10 @@ function CommExtChannel:IsReady()
 	return self.Comm ~= nil and self.Comm:IsReady()
 end
 
+function CommExtChannel:SetReceiveEcho(callback, owner)
+	self.Comm:SetReceivedMessageFunction(callback, owner)
+end
+
 function CommExtChannel:AddReceiveCallback(callback, owner)
 	if type(callback) == "function" then
 		table.insert(self.Callbacks, {Callback = callback, Owner = owner})
@@ -144,7 +237,6 @@ end
 
 function CommExtChannel:OnJoinResult(channel, eResult)
 	if eResult == ICCommLib.CodeEnumICCommJoinResult.Join then
-		self:Print(string.format('Joined ICComm Channel "%s"', channel:GetName()))
 		if channel:IsReady() then
 			self:Print('Channel is ready to transmit')
 		else
@@ -179,7 +271,8 @@ end
 
 function CommExtChannel:SendPrivateMessage(recipient, message, version, priority) -- secretly doubles as the non-private-message function.
 	LibCommExt:EnsureInit()
-	LibCommExtQueue:AddToQueue({Message = message, Recipient = recipient, Version = version}, priority, self)
+	LibCommExt:AddToQueue({Message = message, Recipient = recipient, Version = version, Priority = priority, SendingLibrary = self})
+	--self:SendActualMessage({Message = message, Recipient = recipient, Version = version})
 end
 
 function CommExtChannel:SendActualMessage(message)
@@ -209,9 +302,9 @@ function CommExtChannel:SendActualMessage(message)
 end
 
 function CommExtChannel:HandleQueue(message, remainingChars)
-	if remainingChars >= message.Length then
+	if remainingChars >= message.Message:len() then
 		if self:SendActualMessage(message) then
-			return message.Message.len()
+			return message.Message:len()
 		end
 	end
 	return 0
@@ -235,4 +328,4 @@ end
 
 LibCommExt:EnsureInit()
 
-Apollo.RegisterPackage(LibCommExt, MAJOR, MINOR, {"LibCommExtQueue"})
+Apollo.RegisterPackage(LibCommExt, MAJOR, MINOR, {})

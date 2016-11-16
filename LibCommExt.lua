@@ -31,6 +31,7 @@ function LibCommExt:EnsureInit()
 		self.ChannelTable = self.ChannelTable or {}
 		setmetatable(self.ChannelTable, {__mode = "v"})
 		self.Queue = self.Queue or {}
+		self.WaitTicks = 0 -- for dealing with large messages
 		self.Initialized = true
 	end
 	if self.Initialized == true then self.Ready = true end
@@ -51,7 +52,7 @@ function LibCommExt:AddToQueue(message)
 	message.SequenceNum = self.SequenceNum
 	table.insert(self.Queue, message)
 	
---[[	table.sort(self.Queue, function(a,b)
+	table.sort(self.Queue, function(a,b)
 		if a == nil and b == nil then return false end
 		if a == nil then return true end -- a should go at the end
 		if b == nil then return false end -- b should go at the end
@@ -61,7 +62,7 @@ function LibCommExt:AddToQueue(message)
 			return a.Priority > b.Priority -- higher priority goes lower in the list
 		end
 		return a.SequenceNum < b.SequenceNum
-	end)]]
+	end)
 	
 	if self.Timer == nil then -- Start sending immediately if we've run out of messages and had been waiting.
 		self:MessageLoop()
@@ -74,6 +75,8 @@ function LibCommExt:IsTableEmpty(table)
 end
 
 function LibCommExt:MessageLoop()
+	self.WaitTicks = (self.WaitTicks or 0) - 1
+	if self.WaitTicks > 0 then return end
 	self:EnsureInit()
 	if self:IsTableEmpty(self.Queue) then
 		self.Timer:Stop()
@@ -82,20 +85,28 @@ function LibCommExt:MessageLoop()
 	end
 	self.CharactersSent = 0
 	self.RemainingCharacters = 90 -- safety margin. We don't want to get throttled, and some addons might use minimal amounts of traffic and not want this library.
+	self.FirstMessage = true
 	for _, v in ipairs(self.Queue) do
-		self.CurrentMessage = v
-		pcall(function() self:HandleMessage() end)
+		if self.RemainingCharacters > 0 then -- not just using continue because apparently in LUA that can break stuff?
+			self.CurrentMessage = v
+			pcall(function() self:HandleMessage() end)
+		end
 	end
 end
 
 function LibCommExt:HandleMessage()
 	self:EnsureInit()
 	if self.CurrentMessage ~= nil and self.CurrentMessage.Message ~= nil then
-		local sent = self.CurrentMessage.SendingLibrary:HandleQueue(self.CurrentMessage, self.RemainingCharacters)
+		local sent = self.CurrentMessage.SendingChannel:HandleQueue(self.CurrentMessage, self.RemainingCharacters, self.First)
 		self.CharactersSent = self.CharactersSent + sent
 		self.RemainingCharacters = self.RemainingCharacters - sent
 		if sent > 0 then
 			self:RemoveFromList(self.Queue, self.CurrentMessage)
+			if self.CharactersSent <= 100 then
+				self.WaitTicks = 1
+			else
+				self.WaitTicks = math.ceil(self.CharactersSent / 100) * 2
+			end
 		end
 	end
 end
@@ -265,14 +276,17 @@ function CommExtChannel:OnMessageReceived(channel, strMessage, strSender)
 	end
 end
 
-function CommExtChannel:SendMessage(message, version, priority)
-	self:SendPrivateMessage(nil, message, version, priority)
+function CommExtChannel:SendPublicMessage(message, version, priority)
+	self:SendMessage(nil, message, version, priority)
 end
 
-function CommExtChannel:SendPrivateMessage(recipient, message, version, priority) -- secretly doubles as the non-private-message function.
+function CommExtChannel:SendPrivateMessage(recipient, message, version, priority)
+	self:SendMessage(recipient, message, version, priority)
+end
+
+function CommExtChannel:SendMessage(recipient, message, version, priority) -- secretly doubles as the non-private-message function.
 	LibCommExt:EnsureInit()
-	LibCommExt:AddToQueue({Message = message, Recipient = recipient, Version = version, Priority = priority, SendingLibrary = self})
-	--self:SendActualMessage({Message = message, Recipient = recipient, Version = version})
+	LibCommExt:AddToQueue({Message = message, Recipient = recipient, Version = version, Priority = priority, SendingChannel = self})
 end
 
 function CommExtChannel:SendActualMessage(message)
@@ -288,21 +302,18 @@ function CommExtChannel:SendActualMessage(message)
 	end
 	if message.Recipient == nil then
 		if self.Comm:SendMessage(message.Message) then
-			self:Print("Message Sent: " .. message.Message)
 			return true
 		end
 	else
 		if self.Comm:SendPrivateMessage(message.Recipient, message.Message) then
-			self:Print("Message Sent to " .. message.Recipient.. ": " .. message.Message)
 			return true
 		end
 	end
-	self:Print(5, "Message sending failed: " .. message)
 	return false
 end
 
-function CommExtChannel:HandleQueue(message, remainingChars)
-	if remainingChars >= message.Message:len() then
+function CommExtChannel:HandleQueue(message, remainingChars, first)
+	if message.Message:len() <= remainingChars or first then
 		if self:SendActualMessage(message) then
 			return message.Message:len()
 		end
